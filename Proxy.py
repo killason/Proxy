@@ -4,6 +4,7 @@ import socket
 import threading
 from dataclasses import dataclass
 from typing import Callable, List, Optional
+from pathlib import Path
 
 import serial
 from serial.tools import list_ports
@@ -586,6 +587,12 @@ class ProxyGUI(QWidget):
     # Slots ----------------------------------------------------------------
     def detect_ports(self):
         ports = [port.device for port in list_ports.comports()]
+
+        # Добавляем tty0tty
+        for p in sorted(Path("/dev").glob("tnt*")):
+            if p.is_char_device():
+                ports.append(str(p))
+
         if ports != self.last_ports:
             current_src = self.src_port.currentText()
             current_dst = self.dst_port.currentText()

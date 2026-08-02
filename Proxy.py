@@ -370,6 +370,7 @@ class SnifferThread(threading.Thread):
                 frames = in_framer.feed(resp, now)
                 for frame in frames:
                     self.log("in", self._ts(start_time) + f" ←IN {hex_bytes(frame)}")
+                    self.source.write(frame)
 
             time.sleep(0.002)
 
@@ -379,6 +380,7 @@ class SnifferThread(threading.Thread):
             self.target.write(frame)
         for frame in in_framer.flush():
             self.log("in", self._ts(start_time) + f" ←IN {hex_bytes(frame)}")
+            self.source.write(frame)
 
         try:
             self.source.close()

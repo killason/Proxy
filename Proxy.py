@@ -21,6 +21,7 @@ from PyQt5.QtWidgets import (
     QStackedWidget,
     QFormLayout,
     QGroupBox,
+    QSizePolicy,
 )
 from PyQt5.QtCore import pyqtSignal, Qt, QTimer
 from PyQt5.QtGui import QTextCursor
@@ -453,6 +454,9 @@ class ProxyGUI(QWidget):
         # Framer selection
         self.framer_box = QComboBox()
         self.framer_box.addItems(["SLIP", "Modbus RTU", "ASCII", "Pause", "Marker", "Raw/TCP"])
+        self.framer_box.setMinimumWidth(140)
+        self.framer_box.setMaximumWidth(140)
+        self.framer_box.setSizeAdjustPolicy(QComboBox.AdjustToContents)
 
         self.pause_spin = QSpinBox()
         self.pause_spin.setRange(1, 5000)
@@ -467,23 +471,36 @@ class ProxyGUI(QWidget):
         self.params_stack.addWidget(QWidget())  # Modbus RTU uses serial ctx
 
         pause_page = QWidget()
-        pause_layout = QFormLayout(pause_page)
-        pause_layout.addRow("Pause, ms", self.pause_spin)
+        pause_layout = QHBoxLayout(pause_page)
+        pause_layout.setContentsMargins(0, 0, 0, 0)
+        pause_layout.setSpacing(6)
+        pause_layout.addWidget(QLabel("Pause, ms"))
+        pause_layout.addWidget(self.pause_spin)
         self.params_stack.addWidget(pause_page)
 
         marker_page = QWidget()
-        marker_layout = QFormLayout(marker_page)
-        marker_layout.addRow("Start (hex)", self.marker_start)
-        marker_layout.addRow("End (hex)", self.marker_end)
+        marker_layout = QHBoxLayout(marker_page)
+        marker_layout.setContentsMargins(0, 0, 0, 0)
+        marker_layout.setSpacing(6)
+        marker_layout.addWidget(QLabel("Start"))
+        marker_layout.addWidget(self.marker_start)
+        marker_layout.addWidget(QLabel("End"))
+        marker_layout.addWidget(self.marker_end)
         self.params_stack.addWidget(marker_page)
 
         ascii_page = QWidget()
-        ascii_layout = QFormLayout(ascii_page)
-        ascii_layout.addRow("Start (hex)", self.ascii_start)
-        ascii_layout.addRow("End (hex)", self.ascii_end)
+        ascii_layout = QHBoxLayout(ascii_page)
+        ascii_layout.setContentsMargins(0, 0, 0, 0)
+        ascii_layout.setSpacing(6)
+        ascii_layout.addWidget(QLabel("Start"))
+        ascii_layout.addWidget(self.ascii_start)
+        ascii_layout.addWidget(QLabel("End"))
+        ascii_layout.addWidget(self.ascii_end)
         self.params_stack.addWidget(ascii_page)
 
         self.params_stack.addWidget(QWidget())  # Raw/TCP
+        self.params_stack.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Fixed)
+        self.params_stack.setFixedHeight(32)
 
         # Logs
         self.out_log = QTextEdit()
@@ -505,9 +522,13 @@ class ProxyGUI(QWidget):
 
         framer_group = QGroupBox("Framing")
         fg_layout = QHBoxLayout(framer_group)
-        fg_layout.addWidget(QLabel("Strategy:"))
-        fg_layout.addWidget(self.framer_box)
-        fg_layout.addWidget(self.params_stack)
+        fg_layout.setContentsMargins(8, 8, 8, 8)
+        fg_layout.setSpacing(8)
+        fg_layout.addWidget(QLabel("Strategy:"), 0, Qt.AlignLeft)
+        fg_layout.addWidget(self.framer_box, 0, Qt.AlignLeft)
+        fg_layout.addWidget(self.params_stack, 0, Qt.AlignLeft)
+        fg_layout.addStretch(1)
+        framer_group.setMaximumHeight(90)
 
         button_layout = QHBoxLayout()
         button_layout.addWidget(self.start_button)

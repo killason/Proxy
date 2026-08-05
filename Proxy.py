@@ -796,6 +796,15 @@ class ProxyGUI(QWidget):
         self.src_type.currentIndexChanged.connect(self._toggle_src_view)
         self.dst_type.currentIndexChanged.connect(self._toggle_dst_view)
         self.log_signal.connect(self._log)
+        self._sync_scroll = False
+
+        self.out_log.verticalScrollBar().valueChanged.connect(
+            self._sync_from_out
+        )
+
+        self.in_log.verticalScrollBar().valueChanged.connect(
+            self._sync_from_in
+        )
 
         self._connect_validation_signals()
 
@@ -808,6 +817,29 @@ class ProxyGUI(QWidget):
         self._on_framer_changed(0)
         self._toggle_src_view()
         self._toggle_dst_view()
+
+    def _sync_from_out(self, value):
+
+        if self._sync_scroll:
+            return
+
+        self._sync_scroll = True
+
+        self.in_log.verticalScrollBar().setValue(value)
+
+        self._sync_scroll = False
+
+
+    def _sync_from_in(self, value):
+
+        if self._sync_scroll:
+            return
+
+        self._sync_scroll = True
+
+        self.out_log.verticalScrollBar().setValue(value)
+
+        self._sync_scroll = False
 
     def _connect_validation_signals(self):
         for widget in [
@@ -842,14 +874,14 @@ class ProxyGUI(QWidget):
             endpoint.close()
             return True
         except Exception as e:
-            self.log_signal.emit("out", f"{label} config check: {e}")
+            self.log_signal.emit("info", f"{label} config check: {e}")
             return False
 
     def _validate_current_configuration(self):
         try:
             src_cfg, dst_cfg = self._build_endpoints()
         except ValueError as e:
-            self.log_signal.emit("out", f"Config error: {e}")
+            self.log_signal.emit("info", f"Config error: {e}")
             return False
 
         if isinstance(src_cfg, SerialConfig) and not self._validate_serial_endpoint("Source", src_cfg):
@@ -922,11 +954,29 @@ class ProxyGUI(QWidget):
         self.params_stack.setCurrentIndex(mapping.get(name, 0))
 
     def _log(self, target: str, message: str):
+
         if target == "out":
+
             self.out_log.append(message)
+            self.in_log.append("")
+
             self.out_log.moveCursor(QTextCursor.End)
-        else:
+            self.in_log.moveCursor(QTextCursor.End)
+
+        elif target == "in":
+
+            self.out_log.append("")
             self.in_log.append(message)
+
+            self.out_log.moveCursor(QTextCursor.End)
+            self.in_log.moveCursor(QTextCursor.End)
+
+        else:
+
+            self.out_log.append(message)
+            self.in_log.append(message)
+
+            self.out_log.moveCursor(QTextCursor.End)
             self.in_log.moveCursor(QTextCursor.End)
 
     # Actions --------------------------------------------------------------
@@ -937,11 +987,11 @@ class ProxyGUI(QWidget):
             src_cfg, dst_cfg = self._build_endpoints()
             framer_params = self._collect_framer_params()
         except ValueError as e:
-            self.log_signal.emit("out", f"Config error: {e}")
+            self.log_signal.emit("info", f"Config error: {e}")
             return
 
         if not self._validate_current_configuration():
-            self.log_signal.emit("out", "Start aborted: serial port could not be opened")
+            self.log_signal.emit("info", "Start aborted: serial port could not be opened")
             return
 
         serial_ctx_out = src_cfg if isinstance(src_cfg, SerialConfig) else None

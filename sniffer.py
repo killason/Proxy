@@ -628,8 +628,8 @@ class SnifferThread(threading.Thread):
         except Exception as e:
 
             self.log(
-                "out",
-                self._ts(start_time) + f"ERROR: {e}"
+                "info",
+                self._ts(start_time) + f"Ошибка: {e}"
             )
 
             return
@@ -637,8 +637,8 @@ class SnifferThread(threading.Thread):
         self.running = True
 
         self.log(
-            "out",
-            self._ts(start_time) + "Sniffer started"
+            "info",
+            self._ts(start_time) + "Сниффер запущен"
         )
 
         out_framer = make_framer(

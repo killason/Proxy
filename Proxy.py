@@ -1,9 +1,19 @@
+import struct
 import sys
 import time
 import socket
 import threading
 from dataclasses import dataclass
 from typing import Callable, List, Optional
+from pathlib import Path
+from sniffer import (
+    SerialConfig,
+    TcpConfig,
+    SerialEndpoint,
+    TcpEndpoint,
+    SnifferThread,
+    make_framer,
+)
 
 import serial
 from serial.tools import list_ports
@@ -43,355 +53,585 @@ def parse_hex_string(value: str) -> bytes:
         return b""
 
 
+def crc16_modbus(data: bytes) -> int:
+    crc = 0xFFFF
+    for byte in data:
+        crc ^= byte
+        for _ in range(8):
+            if crc & 0x0001:
+                crc = (crc >> 1) ^ 0xA001
+            else:
+                crc >>= 1
+    return crc & 0xFFFF
+
+
+def crc16_modbus_bytes(data: bytes) -> bytes:
+    return struct.pack("<H", crc16_modbus(data))
+
+
 # --- Endpoint configs --------------------------------------------------------
 
-@dataclass
-class SerialConfig:
-    port: str
-    baudrate: int
-    bytesize: int
-    parity: str
-    stopbits: float
-    timeout: float = 0.05
+# @dataclass
+# class SerialConfig:
+#     port: str
+#     baudrate: int
+#     bytesize: int
+#     parity: str
+#     stopbits: float
+#     timeout: float = 0
 
 
-@dataclass
-class TcpConfig:
-    host: str
-    port: int
-    timeout: float = 0.05
+# @dataclass
+# class TcpConfig:
+#     host: str
+#     port: int
+#     timeout: float = 0.05
 
 
-class SerialEndpoint:
-    def __init__(self, cfg: SerialConfig):
-        self.cfg = cfg
-        self.ser: Optional[serial.Serial] = None
+# class SerialEndpoint:
+#     def __init__(self, cfg: SerialConfig):
+#         self.cfg = cfg
+#         self.ser: Optional[serial.Serial] = None
 
-    def open(self):
-        parity = {
-            "N": serial.PARITY_NONE,
-            "E": serial.PARITY_EVEN,
-            "O": serial.PARITY_ODD,
-            "M": serial.PARITY_MARK,
-            "S": serial.PARITY_SPACE,
-        }.get(self.cfg.parity, serial.PARITY_NONE)
-        stop = {
-            1: serial.STOPBITS_ONE,
-            1.5: serial.STOPBITS_ONE_POINT_FIVE,
-            2: serial.STOPBITS_TWO,
-        }.get(self.cfg.stopbits, serial.STOPBITS_ONE)
+#     def open(self):
+#         parity = {
+#             "N": serial.PARITY_NONE,
+#             "E": serial.PARITY_EVEN,
+#             "O": serial.PARITY_ODD,
+#             "M": serial.PARITY_MARK,
+#             "S": serial.PARITY_SPACE,
+#         }.get(self.cfg.parity, serial.PARITY_NONE)
 
-        self.ser = serial.Serial(
-            self.cfg.port,
-            baudrate=self.cfg.baudrate,
-            bytesize=self.cfg.bytesize,
-            parity=parity,
-            stopbits=stop,
-            timeout=self.cfg.timeout,
-        )
+#         stop = {
+#             1: serial.STOPBITS_ONE,
+#             1.5: serial.STOPBITS_ONE_POINT_FIVE,
+#             2: serial.STOPBITS_TWO,
+#         }.get(self.cfg.stopbits, serial.STOPBITS_ONE)
 
-    def read(self, size=1024) -> bytes:
-        if not self.ser:
-            return b""
-        try:
-            return self.ser.read(size)
-        except (serial.SerialException, OSError):
-            return b""
+#         self.ser = serial.Serial(
+#             port=self.cfg.port,
+#             baudrate=self.cfg.baudrate,
+#             bytesize=self.cfg.bytesize,
+#             parity=parity,
+#             stopbits=stop,
+#             timeout=0,
+#             write_timeout=0.2,
+#             inter_byte_timeout=None,
+#             exclusive=True,
+#         )
 
-    def write(self, data: bytes):
-        if not self.ser:
-            return
-        try:
-            self.ser.write(data)
-        except (serial.SerialException, OSError):
-            pass
+#         self.ser.reset_input_buffer()
+#         self.ser.reset_output_buffer()
 
-    def close(self):
-        if self.ser and self.ser.is_open:
-            try:
-                self.ser.close()
-            except Exception:
-                pass
+#     def read(self, size=1024) -> bytes:
+#         if not self.ser or not self.ser.is_open:
+#             return b""
+
+#         try:
+#             waiting = self.ser.in_waiting
+
+#             if waiting == 0:
+#                 return b""
+
+#             return self.ser.read(waiting)
+
+#         except (serial.SerialException, OSError, TypeError, ValueError):
+#             return b""
+
+#     def write(self, data: bytes):
+#         if not self.ser or not self.ser.is_open:
+#             return
+
+#         if not data:
+#             return
+
+#         try:
+#             view = memoryview(data)
+
+#             while view:
+#                 written = self.ser.write(view)
+
+#                 if written is None:
+#                     break
+
+#                 if written == 0:
+#                     break
+
+#                 view = view[written:]
+
+#         except (
+#             serial.SerialTimeoutException,
+#             serial.SerialException,
+#             OSError,
+#             TypeError,
+#             ValueError,
+#         ):
+#             pass
+
+#     def close(self):
+#         ser = self.ser
+#         self.ser = None
+#         if ser and ser.is_open:
+#             try:
+#                 ser.cancel_read()
+#             except Exception:
+#                 pass
+#             try:
+#                 ser.close()
+#             except Exception:
+#                 pass
 
 
-class TcpEndpoint:
-    def __init__(self, cfg: TcpConfig):
-        self.cfg = cfg
-        self.sock: Optional[socket.socket] = None
+# class TcpEndpoint:
+#     def __init__(self, cfg: TcpConfig):
+#         self.cfg = cfg
+#         self.sock: Optional[socket.socket] = None
 
-    def open(self):
-        self.sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        self.sock.settimeout(self.cfg.timeout)
-        self.sock.connect((self.cfg.host, self.cfg.port))
+#     def open(self):
+#         self.sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+#         self.sock.settimeout(self.cfg.timeout)
+#         self.sock.connect((self.cfg.host, self.cfg.port))
 
-    def read(self, size=1024) -> bytes:
-        if not self.sock:
-            return b""
-        try:
-            return self.sock.recv(size)
-        except (socket.timeout, BlockingIOError):
-            return b""
-        except OSError:
-            return b""
+#     def read(self, size=1024) -> bytes:
+#         if not self.sock:
+#             return b""
+#         try:
+#             return self.sock.recv(size)
+#         except (socket.timeout, BlockingIOError):
+#             return b""
+#         except OSError:
+#             return b""
 
-    def write(self, data: bytes):
-        if not self.sock:
-            return
-        try:
-            self.sock.sendall(data)
-        except OSError:
-            pass
+#     def write(self, data: bytes):
+#         if not self.sock:
+#             return
+#         try:
+#             self.sock.sendall(data)
+#         except OSError:
+#             pass
 
-    def close(self):
-        if self.sock:
-            try:
-                self.sock.close()
-            except Exception:
-                pass
+#     def close(self):
+#         if self.sock:
+#             try:
+#                 self.sock.close()
+#             except Exception:
+#                 pass
 
 
 # --- Framers -----------------------------------------------------------------
 
 
-class BaseFramer:
-    def feed(self, data: bytes, now: float) -> List[bytes]:
-        return [data] if data else []
+# class BaseFramer:
+#     def feed(self, data: bytes, now: float) -> List[bytes]:
+#         return [data] if data else []
 
-    def flush(self) -> List[bytes]:
-        return []
-
-
-class SlipFramer(BaseFramer):
-    def __init__(self):
-        self.buffer = bytearray()
-
-    def feed(self, data: bytes, now: float) -> List[bytes]:
-        frames = []
-        for b in data:
-            if b == 0xC0:
-                if self.buffer:
-                    frames.append(bytes(self.buffer))
-                self.buffer = bytearray([b])
-            else:
-                if self.buffer:
-                    self.buffer.append(b)
-        return frames
-
-    def flush(self) -> List[bytes]:
-        if self.buffer:
-            f = bytes(self.buffer)
-            self.buffer = bytearray()
-            return [f]
-        return []
+#     def flush(self, now: Optional[float] = None) -> List[bytes]:
+#         return []
 
 
-class PauseFramer(BaseFramer):
-    def __init__(self, pause_ms: int):
-        self.buffer = bytearray()
-        self.last_time: Optional[float] = None
-        self.pause = pause_ms / 1000.0
+# class SlipFramer(BaseFramer):
+#     def __init__(self):
+#         self.buffer = bytearray()
+#         self.in_frame = False
+#         self.escaped = False
 
-    def feed(self, data: bytes, now: float) -> List[bytes]:
-        frames = []
-        for b in data:
-            if self.last_time is not None and (now - self.last_time) > self.pause and self.buffer:
-                frames.append(bytes(self.buffer))
-                self.buffer = bytearray()
-            self.buffer.append(b)
-            self.last_time = now
-        return frames
+#     def feed(self, data: bytes, now: float) -> List[bytes]:
+#         frames = []
+#         if not data:
+#             return frames
 
-    def flush(self) -> List[bytes]:
-        if self.buffer:
-            f = bytes(self.buffer)
-            self.buffer = bytearray()
-            return [f]
-        return []
+#         for b in data:
+#             if self.escaped:
+#                 if b == 0xDC:
+#                     self.buffer.append(0xC0)
+#                 elif b == 0xDD:
+#                     self.buffer.append(0xDB)
+#                 else:
+#                     self.buffer.append(b)
+#                 self.escaped = False
+#                 continue
 
+#             if b == 0xDB:
+#                 self.escaped = True
+#                 continue
 
-class ModbusRtuFramer(PauseFramer):
-    def __init__(self, baudrate: int, databits: int, parity: str, stopbits: float):
-        # Character time: start + data bits + parity + stop bits
-        parity_bits = 1 if parity != "N" else 0
-        bits_per_char = 1 + databits + parity_bits + stopbits
-        char_time = bits_per_char / float(baudrate)
-        pause_ms = int(3.5 * char_time * 1000)
-        pause_ms = max(pause_ms, 2)
-        super().__init__(pause_ms)
+#             if b == 0xC0:
+#                 if self.in_frame:
+#                     if self.buffer:
+#                         frames.append(bytes(self.buffer))
+#                     self.buffer = bytearray()
+#                     self.in_frame = False
+#                 else:
+#                     self.buffer = bytearray()
+#                     self.in_frame = True
+#                 continue
 
+#             if self.in_frame:
+#                 self.buffer.append(b)
 
-class AsciiFramer(BaseFramer):
-    def __init__(self, start: bytes = b":", end: bytes = b"\r\n"):
-        self.buffer = bytearray()
-        self.start = start or b":"
-        self.end = end or b"\r\n"
-        self.matching = False
+#         return frames
 
-    def feed(self, data: bytes, now: float) -> List[bytes]:
-        frames = []
-        for b in data:
-            if not self.matching:
-                if bytes([b]) == self.start:
-                    self.buffer = bytearray([b])
-                    self.matching = True
-                continue
-            else:
-                self.buffer.append(b)
-                if self.buffer.endswith(self.end):
-                    frames.append(bytes(self.buffer))
-                    self.buffer = bytearray()
-                    self.matching = False
-        return frames
-
-    def flush(self) -> List[bytes]:
-        if self.buffer:
-            f = bytes(self.buffer)
-            self.buffer = bytearray()
-            self.matching = False
-            return [f]
-        return []
+#     def flush(self, now: Optional[float] = None) -> List[bytes]:
+#         if self.buffer and not self.in_frame:
+#             f = bytes(self.buffer)
+#             self.buffer = bytearray()
+#             self.escaped = False
+#             return [f] if f else []
+#         return []
 
 
-class MarkerFramer(BaseFramer):
-    def __init__(self, start: bytes, end: bytes):
-        self.start = start
-        self.end = end or start
-        self.buffer = bytearray()
-        self.in_frame = False
+# class PauseFramer(BaseFramer):
+#     def __init__(self, pause_ms: int):
+#         self.pause = max(pause_ms / 1000.0, 0.001)
+#         self.buffer = bytearray()
+#         self.last_rx = None
 
-    def feed(self, data: bytes, now: float) -> List[bytes]:
-        frames = []
-        i = 0
-        while i < len(data):
-            if not self.in_frame:
-                if self.start and data[i : i + len(self.start)] == self.start:
-                    self.buffer = bytearray(self.start)
-                    self.in_frame = True
-                    i += len(self.start)
-                    continue
-                elif not self.start:
-                    self.buffer = bytearray()
-                    self.in_frame = True
-            else:
-                self.buffer.append(data[i])
-                if self.end and len(self.buffer) >= len(self.end):
-                    if self.buffer[-len(self.end) :] == self.end:
-                        frames.append(bytes(self.buffer))
-                        self.buffer = bytearray()
-                        self.in_frame = False
-            i += 1
-        return frames
+#     def feed(self, data: bytes, now: float) -> list[bytes]:
+#         if not data:
+#             return []
 
-    def flush(self) -> List[bytes]:
-        if self.buffer:
-            f = bytes(self.buffer)
-            self.buffer = bytearray()
-            self.in_frame = False
-            return [f]
-        return []
+#         self.buffer.extend(data)
+#         self.last_rx = now
+#         print("FEED", len(self.buffer), round(now, 3))
+
+#         return []
+
+#     def flush(self, now: float | None = None) -> list[bytes]:
+#         if not self.buffer:
+#             return []
+
+#         if self.last_rx is None:
+#             return []
+
+#         if now is None:
+#             now = time.monotonic()
+
+#         dt = now - self.last_rx
+
+#         print(
+#             "DT",
+#             round(dt, 3),
+#             "PAUSE",
+#             round(self.pause, 3),
+#             "BUF",
+#             len(self.buffer),
+#         )
+
+#         if dt < self.pause:
+#             return []
+
+#         frame = bytes(self.buffer)
+
+#         self.buffer.clear()
+#         self.last_rx = None
+
+#         print("EMIT", len(frame))
+
+#         return [frame]
 
 
-class RawFramer(BaseFramer):
-    def feed(self, data: bytes, now: float) -> List[bytes]:
-        return [data] if data else []
+# class ModbusRtuFramer(PauseFramer):
+#     def __init__(self, baudrate: int, databits: int, parity: str, stopbits: float):
+#         parity_bits = 0 if parity == "N" else 1
+#         bits_per_char = 1 + databits + parity_bits + stopbits
+
+#         char_time = bits_per_char / float(baudrate)
+#         pause_ms = max(int(char_time * 3.5 * 1000), 1)
+
+#         super().__init__(pause_ms)
 
 
-def make_framer(kind: str, params: dict, serial_ctx: Optional[SerialConfig]) -> BaseFramer:
-    if kind == "SLIP":
-        return SlipFramer()
-    if kind == "Modbus RTU":
-        baud = serial_ctx.baudrate if serial_ctx else 9600
-        return ModbusRtuFramer(baud, params.get("databits", 8), params.get("parity", "N"), params.get("stopbits", 1))
-    if kind == "ASCII":
-        start = parse_hex_string(params.get("start", "3A")) or b":"
-        end = parse_hex_string(params.get("end", "0D0A")) or b"\r\n"
-        return AsciiFramer(start=start, end=end)
-    if kind == "Pause":
-        return PauseFramer(params.get("pause_ms", 20))
-    if kind == "Marker":
-        start = parse_hex_string(params.get("start", ""))
-        end = parse_hex_string(params.get("end", ""))
-        return MarkerFramer(start=start, end=end)
-    return RawFramer()
+# class AsciiFramer(BaseFramer):
+#     def __init__(self, start: bytes = b":", end: bytes = b"\r\n"):
+#         self.buffer = bytearray()
+#         self.start = start or b":"
+#         self.end = end or b"\r\n"
+#         self.matching = False
+
+#     def feed(self, data: bytes, now: float) -> List[bytes]:
+#         frames = []
+#         for b in data:
+#             if not self.matching:
+#                 if bytes([b]) == self.start:
+#                     self.buffer = bytearray([b])
+#                     self.matching = True
+#                 continue
+#             else:
+#                 self.buffer.append(b)
+#                 if self.buffer.endswith(self.end):
+#                     frames.append(bytes(self.buffer))
+#                     self.buffer = bytearray()
+#                     self.matching = False
+#         return frames
+
+#     def flush(self, now: Optional[float] = None) -> List[bytes]:
+#         if self.buffer and now is None:
+#             f = bytes(self.buffer)
+#             self.buffer = bytearray()
+#             self.matching = False
+#             return [f]
+#         return []
+
+
+# class MarkerFramer(BaseFramer):
+#     def __init__(self, start: bytes, end: bytes):
+#         self.start = start
+#         self.end = end or start
+#         self.buffer = bytearray()
+#         self.in_frame = False
+
+#     def feed(self, data: bytes, now: float) -> List[bytes]:
+#         frames = []
+#         if not data:
+#             return frames
+
+#         self.buffer.extend(data)
+
+#         while True:
+#             if not self.in_frame:
+#                 if self.start:
+#                     idx = self.buffer.find(self.start)
+#                     if idx < 0:
+#                         self.buffer = bytearray()
+#                         break
+#                     self.buffer = self.buffer[idx + len(self.start) :]
+#                     self.in_frame = True
+#                 else:
+#                     self.in_frame = True
+
+#             if not self.end:
+#                 frames.append(bytes(self.buffer))
+#                 self.buffer = bytearray()
+#                 self.in_frame = False
+#                 break
+
+#             idx = self.buffer.find(self.end)
+#             if idx < 0:
+#                 break
+
+#             frame = bytes(self.buffer[:idx])
+#             if frame:
+#                 frames.append(frame)
+#             self.buffer = self.buffer[idx + len(self.end) :]
+#             self.in_frame = False
+
+#         return frames
+
+#     def flush(self, now: Optional[float] = None) -> List[bytes]:
+#         if self.buffer and now is None:
+#             f = bytes(self.buffer)
+#             self.buffer = bytearray()
+#             self.in_frame = False
+#             return [f]
+#         return []
+
+
+# class RawFramer(BaseFramer):
+#     def feed(self, data: bytes, now: float) -> List[bytes]:
+#         return [data] if data else []
+
+
+# def make_framer(kind: str, params: dict, serial_ctx: Optional[SerialConfig]) -> BaseFramer:
+#     if kind == "SLIP":
+#         return SlipFramer()
+#     if kind == "Modbus RTU":
+#         baud = serial_ctx.baudrate if serial_ctx else 9600
+#         return ModbusRtuFramer(baud, params.get("databits", 8), params.get("parity", "N"), params.get("stopbits", 1))
+#     if kind == "ASCII":
+#         start = parse_hex_string(params.get("start", "3A")) or b":"
+#         end = parse_hex_string(params.get("end", "0D0A")) or b"\r\n"
+#         return AsciiFramer(start=start, end=end)
+#     if kind == "Pause":
+#         return PauseFramer(params.get("pause_ms", 20))
+#     if kind == "Marker":
+#         start = parse_hex_string(params.get("start", ""))
+#         end = parse_hex_string(params.get("end", ""))
+#         return MarkerFramer(start=start, end=end)
+#     return RawFramer()
 
 
 # --- Worker thread -----------------------------------------------------------
 
 
-class SnifferThread(threading.Thread):
-    def __init__(
-        self,
-        source,
-        target,
-        framer_kind: str,
-        framer_params: dict,
-        log_callback: Callable[[str, str], None],
-        serial_ctx_out: Optional[SerialConfig],
-        serial_ctx_in: Optional[SerialConfig],
-    ):
-        super().__init__(daemon=True)
-        self.source = source
-        self.target = target
-        self.log = log_callback
-        self.framer_kind = framer_kind
-        self.framer_params = framer_params
-        self.serial_ctx_out = serial_ctx_out
-        self.serial_ctx_in = serial_ctx_in
-        self.running = False
+# class SnifferThread(threading.Thread):
+#     def __init__(
+#         self,
+#         source,
+#         target,
+#         framer_kind: str,
+#         framer_params: dict,
+#         log_callback: Callable[[str, str], None],
+#         serial_ctx_out: Optional[SerialConfig],
+#         serial_ctx_in: Optional[SerialConfig],
+#     ):
+#         super().__init__(daemon=True)
 
-    def stop(self):
-        self.running = False
+#         self.source = source
+#         self.target = target
 
-    def run(self):
-        start_time = time.time()
-        out_framer = make_framer(self.framer_kind, self.framer_params, self.serial_ctx_out)
-        in_framer = make_framer(self.framer_kind, self.framer_params, self.serial_ctx_in)
-        try:
-            self.source.open()
-            self.target.open()
-        except Exception as e:
-            self.log("out", self._ts(start_time) + f" ERROR open: {e}")
-            return
+#         self.log = log_callback
 
-        self.running = True
-        self.log("out", self._ts(start_time) + " Sniffer started")
-        while self.running:
-            now = time.time()
+#         self.framer_kind = framer_kind
+#         self.framer_params = framer_params
 
-            data = self.source.read(1024)
-            if data:
-                frames = out_framer.feed(data, now)
-                for frame in frames:
-                    self.log("out", self._ts(start_time) + f" OUT→ {hex_bytes(frame)}")
-                    self.target.write(frame)
+#         self.serial_ctx_out = serial_ctx_out
+#         self.serial_ctx_in = serial_ctx_in
 
-            resp = self.target.read(1024)
-            if resp:
-                frames = in_framer.feed(resp, now)
-                for frame in frames:
-                    self.log("in", self._ts(start_time) + f" ←IN {hex_bytes(frame)}")
+#         self.running = False
 
-            time.sleep(0.002)
+#         self._threads = []
 
-        # flush pending frames
-        for frame in out_framer.flush():
-            self.log("out", self._ts(start_time) + f" OUT→ {hex_bytes(frame)}")
-            self.target.write(frame)
-        for frame in in_framer.flush():
-            self.log("in", self._ts(start_time) + f" ←IN {hex_bytes(frame)}")
+#     def stop(self):
+#         self.running = False
 
-        try:
-            self.source.close()
-            self.target.close()
-        except Exception:
-            pass
-        self.log("out", self._ts(start_time) + " Sniffer stopped")
+#         for t in self._threads:
+#             try:
+#                 t.join(timeout=0.5)
+#             except Exception:
+#                 pass
 
-    def _ts(self, start, now=None):
-        if now is None:
-            now = time.time()
-        t = now - start
-        return f"[{int(t):03}.{int((t-int(t))*1000):03}] "
+#         try:
+#             self.source.close()
+#         except Exception:
+#             pass
+
+#         try:
+#             self.target.close()
+#         except Exception:
+#             pass
+
+#     def run(self):
+
+#         start_time = time.time()
+
+#         try:
+#             self.source.open()
+#             self.target.open()
+#         except Exception as e:
+#             self.log("out", self._ts(start_time) + f" ERROR open: {e}")
+#             return
+
+#         self.running = True
+
+#         self.log("out", self._ts(start_time) + " Sniffer started")
+
+#         out_framer = make_framer(
+#             self.framer_kind,
+#             self.framer_params,
+#             self.serial_ctx_out,
+#         )
+
+#         in_framer = make_framer(
+#             self.framer_kind,
+#             self.framer_params,
+#             self.serial_ctx_in,
+#         )
+
+#         t1 = threading.Thread(
+#             target=self._forward,
+#             daemon=True,
+#             args=(
+#                 self.source,
+#                 self.target,
+#                 out_framer,
+#                 "out",
+#                 start_time,
+#                 " OUT→ ",
+#             ),
+#         )
+
+#         t2 = threading.Thread(
+#             target=self._forward,
+#             daemon=True,
+#             args=(
+#                 self.target,
+#                 self.source,
+#                 in_framer,
+#                 "in",
+#                 start_time,
+#                 " ←IN ",
+#             ),
+#         )
+
+#         self._threads = [t1, t2]
+
+#         t1.start()
+#         t2.start()
+
+#         while self.running:
+
+#             if not t1.is_alive():
+#                 break
+
+#             if not t2.is_alive():
+#                 break
+
+#             time.sleep(0.05)
+
+#         self.running = False
+
+#     def _forward(
+#         self,
+#         rx,
+#         tx,
+#         framer,
+#         log_target,
+#         start_time,
+#         prefix,
+#     ):
+#         while self.running:
+
+#             try:
+#                 data = rx.read(4096)
+#             except Exception:
+#                 break
+
+#             if data:
+
+#                 # Передача всегда сразу.
+#                 try:
+#                     tx.write(data)
+#                 except Exception:
+#                     pass
+
+#                 now = time.monotonic()
+
+#                 #
+#                 # RAW / ASCII / MARKER / SLIP могут вернуть кадры сразу.
+#                 #
+#                 frames = framer.feed(data, now)
+
+#                 if frames:
+#                     for frame in frames:
+#                         self.log(
+#                             log_target,
+#                             self._ts(start_time)
+#                             + prefix
+#                             + hex_bytes(frame),
+#                         )
+
+#             #
+#             # Для режимов, работающих по таймауту
+#             # (Pause, Modbus RTU), проверяем окончание кадра
+#             # каждый проход цикла.
+#             #
+#             now = time.monotonic()
+
+#             frames = framer.flush(now)
+
+#             if frames:
+#                 for frame in frames:
+#                     self.log(
+#                         log_target,
+#                         self._ts(start_time)
+#                         + prefix
+#                         + hex_bytes(frame),
+#                     )
+
+#             #
+#             # Не грузим процессор.
+#             #
+#             time.sleep(0.001)
 
 
 # --- GUI ---------------------------------------------------------------------
@@ -556,6 +796,17 @@ class ProxyGUI(QWidget):
         self.src_type.currentIndexChanged.connect(self._toggle_src_view)
         self.dst_type.currentIndexChanged.connect(self._toggle_dst_view)
         self.log_signal.connect(self._log)
+        self._sync_scroll = False
+
+        self.out_log.verticalScrollBar().valueChanged.connect(
+            self._sync_from_out
+        )
+
+        self.in_log.verticalScrollBar().valueChanged.connect(
+            self._sync_from_in
+        )
+
+        self._connect_validation_signals()
 
         # Timers
         self.last_ports: List[str] = []
@@ -566,6 +817,78 @@ class ProxyGUI(QWidget):
         self._on_framer_changed(0)
         self._toggle_src_view()
         self._toggle_dst_view()
+
+    def _sync_from_out(self, value):
+
+        if self._sync_scroll:
+            return
+
+        self._sync_scroll = True
+
+        self.in_log.verticalScrollBar().setValue(value)
+
+        self._sync_scroll = False
+
+
+    def _sync_from_in(self, value):
+
+        if self._sync_scroll:
+            return
+
+        self._sync_scroll = True
+
+        self.out_log.verticalScrollBar().setValue(value)
+
+        self._sync_scroll = False
+
+    def _connect_validation_signals(self):
+        for widget in [
+            self.src_type,
+            self.dst_type,
+            self.src_port,
+            self.dst_port,
+            self.src_baud,
+            self.dst_baud,
+            self.src_data_bits,
+            self.dst_data_bits,
+            self.src_parity,
+            self.dst_parity,
+            self.src_stop,
+            self.dst_stop,
+            self.src_host,
+            self.dst_host,
+            self.src_port_tcp,
+            self.dst_port_tcp,
+        ]:
+            if isinstance(widget, QComboBox):
+                widget.currentIndexChanged.connect(self._validate_current_configuration)
+            elif isinstance(widget, QLineEdit):
+                widget.textChanged.connect(self._validate_current_configuration)
+            elif isinstance(widget, QSpinBox):
+                widget.valueChanged.connect(self._validate_current_configuration)
+
+    def _validate_serial_endpoint(self, label: str, cfg: SerialConfig) -> bool:
+        try:
+            endpoint = SerialEndpoint(cfg)
+            endpoint.open()
+            endpoint.close()
+            return True
+        except Exception as e:
+            self.log_signal.emit("info", f"{label} config check: {e}")
+            return False
+
+    def _validate_current_configuration(self):
+        try:
+            src_cfg, dst_cfg = self._build_endpoints()
+        except ValueError as e:
+            self.log_signal.emit("info", f"Config error: {e}")
+            return False
+
+        if isinstance(src_cfg, SerialConfig) and not self._validate_serial_endpoint("Source", src_cfg):
+            return False
+        if isinstance(dst_cfg, SerialConfig) and not self._validate_serial_endpoint("Target", dst_cfg):
+            return False
+        return True
 
     # UI builders ---------------------------------------------------------
     def _build_endpoint_group(self, title, type_box, port_box, baud_box, data_box, parity_box, stop_box, host_edit, port_spin):
@@ -584,6 +907,12 @@ class ProxyGUI(QWidget):
     # Slots ----------------------------------------------------------------
     def detect_ports(self):
         ports = [port.device for port in list_ports.comports()]
+
+        # Добавляем tty0tty
+        for p in sorted(Path("/dev").glob("tnt*")):
+            if p.is_char_device():
+                ports.append(str(p))
+
         if ports != self.last_ports:
             current_src = self.src_port.currentText()
             current_dst = self.dst_port.currentText()
@@ -625,11 +954,29 @@ class ProxyGUI(QWidget):
         self.params_stack.setCurrentIndex(mapping.get(name, 0))
 
     def _log(self, target: str, message: str):
+
         if target == "out":
+
             self.out_log.append(message)
+            self.in_log.append("")
+
             self.out_log.moveCursor(QTextCursor.End)
-        else:
+            self.in_log.moveCursor(QTextCursor.End)
+
+        elif target == "in":
+
+            self.out_log.append("")
             self.in_log.append(message)
+
+            self.out_log.moveCursor(QTextCursor.End)
+            self.in_log.moveCursor(QTextCursor.End)
+
+        else:
+
+            self.out_log.append(message)
+            self.in_log.append(message)
+
+            self.out_log.moveCursor(QTextCursor.End)
             self.in_log.moveCursor(QTextCursor.End)
 
     # Actions --------------------------------------------------------------
@@ -640,7 +987,11 @@ class ProxyGUI(QWidget):
             src_cfg, dst_cfg = self._build_endpoints()
             framer_params = self._collect_framer_params()
         except ValueError as e:
-            self.log_signal.emit("out", f"Config error: {e}")
+            self.log_signal.emit("info", f"Config error: {e}")
+            return
+
+        if not self._validate_current_configuration():
+            self.log_signal.emit("info", "Start aborted: serial port could not be opened")
             return
 
         serial_ctx_out = src_cfg if isinstance(src_cfg, SerialConfig) else None
@@ -662,7 +1013,7 @@ class ProxyGUI(QWidget):
     def stop_sniffer(self):
         if self.thread:
             self.thread.stop()
-            self.thread.join()
+            self.thread.join(timeout=1.0)
             self.thread = None
         self.start_button.setEnabled(True)
         self.stop_button.setEnabled(False)
